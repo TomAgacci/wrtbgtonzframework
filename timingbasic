@@ -1,0 +1,43 @@
+/*
+ * Binary → Slope → Pulse Duration Table
+ * For quantitative timing‑encoded modulation.
+ *
+ * duration_us = base_us + slope_us * slope_value
+ *
+ * slope_value is normalized (0.0 – 1.0) from the binary pattern.
+ */
+
+typedef struct {
+    uint16_t pattern;        // binary pattern (0..255)
+    uint8_t  bits;           // number of bits
+    double   slope_value;    // normalized slope (pattern / max)
+    double   duration_us;    // computed pulse duration
+} slope_entry_t;
+
+#define MAX_BITS   8
+#define MAX_PATTERNS (1 << MAX_BITS)
+
+double base_us  = 50.0;      // tiny beep baseline
+double slope_us = 200.0;     // slope expansion factor
+
+slope_entry_t slope_table[MAX_PATTERNS] = {
+    /* pattern | bits | slope_value | duration_us */
+    { 0b00000000, 8, 0.000000, base_us + slope_us * 0.000000 }, // smallest beep
+    { 0b00000001, 8, 0.003922, base_us + slope_us * 0.003922 },
+    { 0b00000010, 8, 0.007843, base_us + slope_us * 0.007843 },
+    { 0b00000011, 8, 0.011765, base_us + slope_us * 0.011765 },
+    { 0b00000100, 8, 0.015686, base_us + slope_us * 0.015686 },
+    { 0b00000101, 8, 0.019608, base_us + slope_us * 0.019608 },
+    { 0b00000110, 8, 0.023529, base_us + slope_us * 0.023529 },
+    { 0b00000111, 8, 0.027451, base_us + slope_us * 0.027451 },
+
+    /* mid‑range patterns */
+    { 0b01010101, 8, 0.333333, base_us + slope_us * 0.333333 },
+    { 0b10101010, 8, 0.666667, base_us + slope_us * 0.666667 },
+
+    /* high‑range patterns */
+    { 0b11110000, 8, 0.937500, base_us + slope_us * 0.937500 },
+    { 0b11111111, 8, 1.000000, base_us + slope_us * 1.000000 }, // longest beep
+
+    /* You can auto‑generate the full 256‑entry table in a loop */
+};
