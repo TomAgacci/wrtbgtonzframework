@@ -1,0 +1,17 @@
+double nonlinear_duration(uint16_t pattern,
+                          double base_us,
+                          double slope_us,
+                          int mode)
+{
+    double s;
+
+    switch (mode) {
+        case 0: s = (double)pattern / 65535.0; break; // linear
+        case 1: s = slope_log(pattern); break;
+        case 2: s = slope_exp(pattern); break;
+        case 3: s = slope_sigmoid(pattern); break;
+        default: s = (double)pattern / 65535.0;
+    }
+
+    return base_us + slope_us * s;
+}
