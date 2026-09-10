@@ -1,0 +1,54 @@
+uint16_t decode_linear(double duration_us,
+                       double base_us,
+                       double slope_us)
+{
+    double norm = (duration_us - base_us) / slope_us;
+
+    if (norm < 0.0) norm = 0.0;
+    if (norm > 1.0) norm = 1.0;
+
+    return (uint16_t)round(norm * 65535.0);
+}
+uint16_t decode_log(double duration_us,
+                    double base_us,
+                    double slope_us)
+{
+    double y = (duration_us - base_us) / slope_us;
+    double x = log1p(9.0) * y;
+    double norm = (exp(x) - 1.0) / 9.0;
+
+    return (uint16_t)round(norm * 65535.0);
+}
+uint16_t decode_exp(double duration_us,
+                    double base_us,
+                    double slope_us)
+{
+    double y = (duration_us - base_us) / slope_us;
+    double x = log(y * (exp(5.0) - 1.0) + 1.0) / 5.0;
+
+    return (uint16_t)round(x * 65535.0);
+}
+
+uint16_t decode_exp(double duration_us,
+                    double base_us,
+                    double slope_us)
+{
+    double y = (duration_us - base_us) / slope_us;
+    double x = log(y * (exp(5.0) - 1.0) + 1.0) / 5.0;
+
+    return (uint16_t)round(x * 65535.0);
+}
+uint16_t decode_sigmoid(double duration_us,
+                        double base_us,
+                        double slope_us)
+{
+    double y = (duration_us - base_us) / slope_us;
+    double k = 12.0;
+
+    double x = (log((1.0 / y) - 1.0) / -k) + 0.5;
+
+    if (x < 0.0) x = 0.0;
+    if (x > 1.0) x = 1.0;
+
+    return (uint16_t)round(x * 65535.0);
+}
