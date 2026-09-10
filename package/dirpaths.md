@@ -1,8 +1,8 @@
 wrtbgtonzframework/package/<br>
->morsebandd/<br>
-&nbsp>Makefile<br>
-&nbsp>src/<br>
-&nbsp>morsebandd.c<br>
+morsebandd/<br>
+&nbspMakefile<br>
+&nbspsrc/<br>
+&nbspmorsebandd.c<br>
 >files/<br>
-&nbsp>morsebandd.conf<br>
-&nbsp>morsebandd.init<br>
+&nbspmorsebandd.conf<br>
+&nbspmorsebandd.init<br>
