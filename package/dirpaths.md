@@ -1,7 +1,7 @@
 <pre>wrtbgtonzframework/package/<br>
 >morsebandd/
       >Makefile
->src/<br>
+>src/
       >morsebandd.c
 >files/
       >morsebandd.conf
