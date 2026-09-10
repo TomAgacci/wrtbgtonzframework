@@ -1,8 +1,8 @@
-package/
-  morsebandd/
-    Makefile
-    src/
-      morsebandd.c
-    files/
-      morsebandd.conf
-      morsebandd.init
+package/<br>
+  >morsebandd/<br>
+      >Makefile<br>
+  >src/<br>
+      >morsebandd.c<br>
+  >files/<br>
+      >morsebandd.conf<br>
+      >morsebandd.init<br>
