@@ -1,0 +1,497 @@
+/*
+ * morsebandd.c — Multi-band timing engine with:
+ * - "zero circle math" prepacking (relative local binaries)
+ * - tun/tap virtual interface glue
+ * - FEC / majority-vote with differential priority
+ * - slope-delta predictor
+ * - config parser
+ */
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <math.h>
+#include <time.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/if_tun.h>
+#include <net/if.h>
+
+/* -----------------------------
+   CONFIG STRUCT + PARSER
+   ----------------------------- */
+
+#define MAX_LINE        256
+#define MAX_BITS_16     16
+#define TX_FRAME_BITS   256
+#define RX_FRAME_BITS   256
+#define FREQ_TABLE_SIZE 65536
+#define PREPACK_MAX     1024
+
+typedef struct {
+    int    bands;
+    double base_us;
+    double slope_us;
+    int    mode;             // 0=linear,1=log,2=exp,3=sigmoid
+    double predictor_alpha;
+    double prepack_alpha;    // weight for frequency
+    double prepack_beta;     // weight for neighborhood smoothness
+    double prepack_threshold;
+    double freq_window;
+} morse_config_t;
+
+void config_default(morse_config_t *cfg)
+{
+    cfg->bands            = 8;
+    cfg->base_us          = 50.0;
+    cfg->slope_us         = 200.0;
+    cfg->mode             = 0;
+    cfg->predictor_alpha  = 0.2;
+    cfg->prepack_alpha    = 0.7;
+    cfg->prepack_beta     = 0.3;
+    cfg->prepack_threshold= 0.4;
+    cfg->freq_window      = 1000.0;
+}
+
+void config_load(morse_config_t *cfg, const char *path)
+{
+    config_default(cfg);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), f)) {
+        char key[64], val[64];
+        if (sscanf(line, "%63[^=]=%63s", key, val) != 2) continue;
+
+        if (!strcmp(key, "bands"))              cfg->bands = atoi(val);
+        else if (!strcmp(key, "base_us"))       cfg->base_us = atof(val);
+        else if (!strcmp(key, "slope_us"))      cfg->slope_us = atof(val);
+        else if (!strcmp(key, "mode"))          cfg->mode = atoi(val);
+        else if (!strcmp(key, "predictor_alpha")) cfg->predictor_alpha = atof(val);
+        else if (!strcmp(key, "prepack_alpha")) cfg->prepack_alpha = atof(val);
+        else if (!strcmp(key, "prepack_beta"))  cfg->prepack_beta = atof(val);
+        else if (!strcmp(key, "prepack_threshold")) cfg->prepack_threshold = atof(val);
+        else if (!strcmp(key, "freq_window"))   cfg->freq_window = atof(val);
+    }
+
+    fclose(f);
+}
+
+/* -----------------------------
+   SLOPE MODELS
+   ----------------------------- */
+
+double slope_linear(uint16_t pattern)
+{
+    return (double)pattern / 65535.0;
+}
+
+double slope_log(uint16_t pattern)
+{
+    double x = (double)pattern / 65535.0;
+    return log1p(x * 9.0) / log1p(9.0);
+}
+
+double slope_exp(uint16_t pattern)
+{
+    double x = (double)pattern / 65535.0;
+    return (exp(x * 5.0) - 1.0) / (exp(5.0) - 1.0);
+}
+
+double slope_sigmoid(uint16_t pattern)
+{
+    double x = (double)pattern / 65535.0;
+    double k = 12.0;
+    return 1.0 / (1.0 + exp(-k * (x - 0.5)));
+}
+
+double slope_value(uint16_t pattern, int mode)
+{
+    switch (mode) {
+        case 1: return slope_log(pattern);
+        case 2: return slope_exp(pattern);
+        case 3: return slope_sigmoid(pattern);
+        case 0:
+        default: return slope_linear(pattern);
+    }
+}
+
+double duration_from_pattern(uint16_t pattern,
+                             double base_us,
+                             double slope_us,
+                             int mode)
+{
+    double s = slope_value(pattern, mode);
+    return base_us + slope_us * s;
+}
+
+uint16_t pattern_from_duration(double duration_us,
+                               double base_us,
+                               double slope_us)
+{
+    double norm = (duration_us - base_us) / slope_us;
+    if (norm < 0.0) norm = 0.0;
+    if (norm > 1.0) norm = 1.0;
+    return (uint16_t)round(norm * 65535.0);
+}
+
+/* -----------------------------
+   BIT WINDOW ↔ PATTERN
+   ----------------------------- */
+
+uint16_t bits_to_pattern(const uint8_t *bits)
+{
+    uint16_t p = 0;
+    for (int i = 0; i < MAX_BITS_16; i++) {
+        p <<= 1;
+        p |= bits[i] & 1;
+    }
+    return p;
+}
+
+void pattern_to_bits(uint16_t pattern, uint8_t *bits_out)
+{
+    for (int i = MAX_BITS_16 - 1; i >= 0; i--) {
+        bits_out[i] = pattern & 1;
+        pattern >>= 1;
+    }
+}
+
+/* -----------------------------
+   FREQUENCY TABLE ("local binaries")
+   ----------------------------- */
+
+typedef struct {
+    uint16_t pattern;
+    uint32_t count;
+} freq_entry_t;
+
+freq_entry_t freq_table[FREQ_TABLE_SIZE];
+
+void freq_update(uint16_t pattern)
+{
+    freq_table[pattern].pattern = pattern;
+    freq_table[pattern].count++;
+}
+
+double freq_score(uint16_t pattern, double window_size)
+{
+    return (double)freq_table[pattern].count / window_size;
+}
+
+/* -----------------------------
+   NEIGHBORHOOD SMOOTHNESS ("zero circle")
+   ----------------------------- */
+
+double neighborhood_smoothness(uint16_t pattern,
+                               int mode)
+{
+    int neighbors[] = { -2, -1, 1, 2 };
+    int N = 4;
+    double s_p = slope_value(pattern, mode);
+    double sum = 0.0;
+    int valid = 0;
+
+    for (int i = 0; i < N; i++) {
+        int q = (int)pattern + neighbors[i];
+        if (q < 0 || q > 65535) continue;
+        double s_q = slope_value((uint16_t)q, mode);
+        sum += fabs(s_p - s_q);
+        valid++;
+    }
+
+    if (valid == 0) return 0.0;
+
+    double avg = sum / (double)valid;
+    return 1.0 - avg; // smoother neighborhood → closer to 1
+}
+
+double prepack_score(uint16_t pattern,
+                     const morse_config_t *cfg)
+{
+    double F = freq_score(pattern, cfg->freq_window);
+    double S = neighborhood_smoothness(pattern, cfg->mode);
+    return cfg->prepack_alpha * F + cfg->prepack_beta * S;
+}
+
+int should_prepack(uint16_t pattern,
+                   const morse_config_t *cfg)
+{
+    return prepack_score(pattern, cfg) > cfg->prepack_threshold;
+}
+
+/* -----------------------------
+   PREPACK TABLE
+   ----------------------------- */
+
+typedef struct {
+    uint16_t pattern;
+    double   duration_us;
+} prepack_entry_t;
+
+typedef struct {
+    prepack_entry_t entries[PREPACK_MAX];
+    size_t          count;
+} prepack_table_t;
+
+void prepack_build(prepack_table_t *pt,
+                   const morse_config_t *cfg)
+{
+    pt->count = 0;
+
+    for (uint32_t p = 0; p < FREQ_TABLE_SIZE && pt->count < PREPACK_MAX; p++) {
+        uint16_t pattern = (uint16_t)p;
+        if (!should_prepack(pattern, cfg)) continue;
+
+        pt->entries[pt->count].pattern     = pattern;
+        pt->entries[pt->count].duration_us =
+            duration_from_pattern(pattern, cfg->base_us, cfg->slope_us, cfg->mode);
+        pt->count++;
+    }
+}
+
+double prepack_duration(const prepack_table_t *pt,
+                        uint16_t pattern,
+                        const morse_config_t *cfg)
+{
+    for (size_t i = 0; i < pt->count; i++) {
+        if (pt->entries[i].pattern == pattern)
+            return pt->entries[i].duration_us;
+    }
+    return duration_from_pattern(pattern, cfg->base_us, cfg->slope_us, cfg->mode);
+}
+
+/* -----------------------------
+   SLOPE PREDICTOR (DELTAS)
+   ----------------------------- */
+
+typedef struct {
+    double avg_delta;
+    double alpha;
+    double last_slope;
+} slope_predictor_t;
+
+void predictor_init(slope_predictor_t *p, double alpha)
+{
+    p->avg_delta  = 0.0;
+    p->alpha      = alpha;
+    p->last_slope = 0.0;
+}
+
+void predictor_update(slope_predictor_t *p, double current_slope)
+{
+    double delta = current_slope - p->last_slope;
+    p->avg_delta = p->alpha * delta + (1.0 - p->alpha) * p->avg_delta;
+    p->last_slope = current_slope;
+}
+
+double predictor_next_slope(const slope_predictor_t *p)
+{
+    return p->last_slope + p->avg_delta;
+}
+
+/* -----------------------------
+   FEC / MAJORITY-VOTE LAYER
+   ----------------------------- */
+
+uint16_t majority_vote_patterns(const uint16_t *patterns, int count)
+{
+    uint16_t best = patterns[0];
+    int best_score = 1;
+
+    for (int i = 0; i < count; i++) {
+        int score = 0;
+        for (int j = 0; j < count; j++) {
+            if (patterns[j] == patterns[i]) score++;
+        }
+        if (score > best_score) {
+            best_score = score;
+            best = patterns[i];
+        }
+    }
+    return best;
+}
+
+/* Differential priority: band 0 has highest weight */
+uint16_t weighted_vote_patterns(const uint16_t *patterns, int bands)
+{
+    uint16_t primary = patterns[0];
+
+    int agree_primary = 0;
+    for (int b = 1; b < bands; b++) {
+        if (patterns[b] == primary) agree_primary++;
+    }
+
+    if (agree_primary >= bands / 2) {
+        return primary;
+    } else {
+        return majority_vote_patterns(patterns, bands);
+    }
+}
+
+/* -----------------------------
+   HARDWARE ABSTRACTION (GPIO/RF)
+   ----------------------------- */
+
+void hal_send_pulse(int band, double duration_us)
+{
+    /* TODO: map band → GPIO/RF; stub with sleep */
+    (void)band;
+    usleep((useconds_t)duration_us);
+}
+
+double hal_recv_pulse(int band,
+                      const morse_config_t *cfg)
+{
+    /* TODO: measure pulse duration; stub with random pattern */
+    (void)band;
+    uint16_t pattern = rand() % 65536;
+    return duration_from_pattern(pattern, cfg->base_us, cfg->slope_us, cfg->mode);
+}
+
+/* -----------------------------
+   TUN/TAP GLUE LAYER
+   ----------------------------- */
+
+int tun_alloc(const char *devname)
+{
+    struct ifreq ifr;
+    int fd = open("/dev/net/tun", O_RDWR);
+    if (fd < 0) return -1;
+
+    memset(&ifr, 0, sizeof(ifr));
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+    strncpy(ifr.ifr_name, devname, IFNAMSIZ);
+
+    if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+/* -----------------------------
+   TX ENGINE (MULTI-BAND + PREPACK)
+   ----------------------------- */
+
+void tx_frame_multi_band(const uint8_t *bits,
+                         size_t bit_count,
+                         const morse_config_t *cfg,
+                         slope_predictor_t *predictors,
+                         prepack_table_t *pt)
+{
+    size_t windows = bit_count / MAX_BITS_16;
+    if (windows == 0) return;
+
+    for (size_t w = 0; w < windows; w++) {
+        const uint8_t *win = &bits[w * MAX_BITS_16];
+        uint16_t pattern = bits_to_pattern(win);
+
+        freq_update(pattern);
+
+        double s = slope_value(pattern, cfg->mode);
+        predictor_update(&predictors[0], s);
+
+        double duration_primary =
+            prepack_duration(pt, pattern, cfg);
+
+        double spec_slope = predictor_next_slope(&predictors[0]);
+        if (spec_slope < 0.0) spec_slope = 0.0;
+        if (spec_slope > 1.0) spec_slope = 1.0;
+        double spec_duration = cfg->base_us + cfg->slope_us * spec_slope;
+
+        hal_send_pulse(0, duration_primary);
+
+        for (int b = 1; b < cfg->bands; b++) {
+            hal_send_pulse(b, spec_duration);
+        }
+    }
+}
+
+/* -----------------------------
+   RX ENGINE (MULTI-BAND + FEC)
+   ----------------------------- */
+
+void rx_frame_multi_band(uint8_t *bits_out,
+                         size_t max_bits,
+                         const morse_config_t *cfg)
+{
+    size_t windows = max_bits / MAX_BITS_16;
+    if (windows == 0) return;
+
+    for (size_t w = 0; w < windows; w++) {
+        uint16_t patterns[64];
+        int bands = cfg->bands;
+
+        for (int b = 0; b < bands; b++) {
+            double d = hal_recv_pulse(b, cfg);
+            patterns[b] = pattern_from_duration(d, cfg->base_us, cfg->slope_us);
+        }
+
+        uint16_t final_pattern = weighted_vote_patterns(patterns, bands);
+
+        uint8_t *win = &bits_out[w * MAX_BITS_16];
+        pattern_to_bits(final_pattern, win);
+    }
+}
+
+/* -----------------------------
+   DAEMON MAIN LOOP (TUN/TAP)
+   ----------------------------- */
+
+int main(int argc, char **argv)
+{
+    const char *cfg_path = "/etc/morsebandd.conf";
+    const char *tun_name = "morse0";
+
+    if (argc > 1) cfg_path = argv[1];
+    if (argc > 2) tun_name = argv[2];
+
+    morse_config_t cfg;
+    config_load(&cfg, cfg_path);
+
+    int tun_fd = tun_alloc(tun_name);
+    if (tun_fd < 0) {
+        perror("tun_alloc");
+        return 1;
+    }
+
+    srand((unsigned)time(NULL));
+
+    slope_predictor_t predictors[64];
+    for (int i = 0; i < cfg.bands; i++)
+        predictor_init(&predictors[i], cfg.predictor_alpha);
+
+    prepack_table_t prepack;
+    prepack_build(&prepack, &cfg);
+
+    printf("morsebandd: starting daemon on %s with %d bands\n",
+           tun_name, cfg.bands);
+
+    while (1) {
+        uint8_t tx_bits[TX_FRAME_BITS];
+        uint8_t rx_bits[RX_FRAME_BITS];
+
+        ssize_t n = read(tun_fd, tx_bits, sizeof(tx_bits));
+        if (n <= 0) {
+            usleep(10000);
+            continue;
+        }
+
+        tx_frame_multi_band(tx_bits, TX_FRAME_BITS, &cfg, predictors, &prepack);
+
+        memset(rx_bits, 0, sizeof(rx_bits));
+        rx_frame_multi_band(rx_bits, RX_FRAME_BITS, &cfg);
+
+        write(tun_fd, rx_bits, sizeof(rx_bits));
+
+        usleep(10000);
+    }
+
+    return 0;
+}
