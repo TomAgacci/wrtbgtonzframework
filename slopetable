@@ -1,0 +1,28 @@
+/*
+ * 16-bit Slope Table Generator
+ * pattern range: 0–65535
+ * slope_value = pattern / 65535.0
+ * duration_us = base_us + slope_us * slope_value
+ */
+
+#define MAX_BITS_16     16
+#define MAX_PATTERNS_16 65536
+
+typedef struct {
+    uint16_t pattern;
+    double   slope_value;
+    double   duration_us;
+} slope16_entry_t;
+
+void build_slope16_table(slope16_entry_t *tbl,
+                         double base_us,
+                         double slope_us)
+{
+    for (uint32_t p = 0; p < MAX_PATTERNS_16; ++p) {
+        double norm = (double)p / 65535.0;
+
+        tbl[p].pattern     = (uint16_t)p;
+        tbl[p].slope_value = norm;
+        tbl[p].duration_us = base_us + slope_us * norm;
+    }
+}
