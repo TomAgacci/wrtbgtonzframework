@@ -1,0 +1,296 @@
+/*
+ * morsebandd.c — Multi-band timing-encoded Morse-like engine
+ * - Parallel channels ("bands")
+ * - Slope-based timing (linear/non-linear)
+ * - Quantitative predictor using slope deltas
+ * - OpenWrt-style daemon skeleton
+ * - Hardware abstraction for GPIO/RF
+ */
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <math.h>
+#include <time.h>
+
+/* -----------------------------
+   CONFIG
+   ----------------------------- */
+
+#define BANDS            8          // parallel logical channels
+#define MAX_BITS_16      16
+#define MAX_PATTERNS_16  65536
+
+#define TX_FRAME_BITS    256
+#define RX_FRAME_BITS    256
+
+#define MODE_LINEAR      0
+#define MODE_LOG         1
+#define MODE_EXP         2
+#define MODE_SIGMOID     3
+
+/* -----------------------------
+   SLOPE MODELS
+   ----------------------------- */
+
+double slope_linear(uint16_t pattern)
+{
+    return (double)pattern / 65535.0;
+}
+
+double slope_log(uint16_t pattern)
+{
+    double x = (double)pattern / 65535.0;
+    return log1p(x * 9.0) / log1p(9.0);
+}
+
+double slope_exp(uint16_t pattern)
+{
+    double x = (double)pattern / 65535.0;
+    return (exp(x * 5.0) - 1.0) / (exp(5.0) - 1.0);
+}
+
+double slope_sigmoid(uint16_t pattern)
+{
+    double x = (double)pattern / 65535.0;
+    double k = 12.0;
+    return 1.0 / (1.0 + exp(-k * (x - 0.5)));
+}
+
+double slope_value(uint16_t pattern, int mode)
+{
+    switch (mode) {
+        case MODE_LOG:     return slope_log(pattern);
+        case MODE_EXP:     return slope_exp(pattern);
+        case MODE_SIGMOID: return slope_sigmoid(pattern);
+        case MODE_LINEAR:
+        default:           return slope_linear(pattern);
+    }
+}
+
+/* -----------------------------
+   DURATION ENCODER / DECODER
+   ----------------------------- */
+
+double duration_from_pattern(uint16_t pattern,
+                             double base_us,
+                             double slope_us,
+                             int mode)
+{
+    double s = slope_value(pattern, mode);
+    return base_us + slope_us * s;
+}
+
+/* For simplicity, use linear inverse; non-linear inverse can be added per mode */
+uint16_t pattern_from_duration(double duration_us,
+                               double base_us,
+                               double slope_us)
+{
+    double norm = (duration_us - base_us) / slope_us;
+    if (norm < 0.0) norm = 0.0;
+    if (norm > 1.0) norm = 1.0;
+    return (uint16_t)round(norm * 65535.0);
+}
+
+/* -----------------------------
+   BIT WINDOW → PATTERN
+   ----------------------------- */
+
+uint16_t bits_to_pattern(const uint8_t *bits)
+{
+    uint16_t p = 0;
+    for (int i = 0; i < MAX_BITS_16; i++) {
+        p <<= 1;
+        p |= bits[i] & 1;
+    }
+    return p;
+}
+
+void pattern_to_bits(uint16_t pattern, uint8_t *bits_out)
+{
+    for (int i = MAX_BITS_16 - 1; i >= 0; i--) {
+        bits_out[i] = pattern & 1;
+        pattern >>= 1;
+    }
+}
+
+/* -----------------------------
+   QUANTITATIVE PREDICTOR (SLOPE DELTAS)
+   ----------------------------- */
+
+typedef struct {
+    double avg_delta;
+    double alpha;
+    double last_slope;
+} slope_predictor_t;
+
+void predictor_init(slope_predictor_t *p, double alpha)
+{
+    p->avg_delta  = 0.0;
+    p->alpha      = alpha;
+    p->last_slope = 0.0;
+}
+
+void predictor_update(slope_predictor_t *p, double current_slope)
+{
+    double delta = current_slope - p->last_slope;
+    p->avg_delta = p->alpha * delta + (1.0 - p->alpha) * p->avg_delta;
+    p->last_slope = current_slope;
+}
+
+double predictor_next_slope(const slope_predictor_t *p)
+{
+    return p->last_slope + p->avg_delta;
+}
+
+/* -----------------------------
+   HARDWARE ABSTRACTION LAYER
+   ----------------------------- */
+
+/*
+ * Each band is a logical channel; in real hardware you’d map:
+ * - band index → GPIO pin, RF frequency, or timeslot
+ */
+
+void hal_send_pulse(int band, double duration_us)
+{
+    /* TODO: map band to GPIO/RF; here we just sleep */
+    (void)band;
+    usleep((useconds_t)duration_us);
+}
+
+double hal_recv_pulse(int band)
+{
+    /* TODO: measure pulse duration from hardware; stub with random */
+    (void)band;
+    double base_us  = 50.0;
+    double slope_us = 200.0;
+    uint16_t pattern = rand() % 65536;
+    return duration_from_pattern(pattern, base_us, slope_us, MODE_LINEAR);
+}
+
+/* -----------------------------
+   TX ENGINE (MULTI-BAND)
+   ----------------------------- */
+
+void tx_frame_multi_band(const uint8_t *bits,
+                         size_t bit_count,
+                         double base_us,
+                         double slope_us,
+                         int mode,
+                         slope_predictor_t *predictors)
+{
+    size_t windows = bit_count / MAX_BITS_16;
+    if (windows == 0) return;
+
+    for (size_t w = 0; w < windows; w++) {
+        const uint8_t *win = &bits[w * MAX_BITS_16];
+        uint16_t pattern = bits_to_pattern(win);
+        double s = slope_value(pattern, mode);
+
+        /* Update predictor for band 0 (primary) */
+        predictor_update(&predictors[0], s);
+
+        /* Primary band duration */
+        double duration_primary = duration_from_pattern(pattern, base_us, slope_us, mode);
+
+        /* Speculative slope for other bands */
+        double spec_slope = predictor_next_slope(&predictors[0]);
+        if (spec_slope < 0.0) spec_slope = 0.0;
+        if (spec_slope > 1.0) spec_slope = 1.0;
+
+        double spec_duration = base_us + slope_us * spec_slope;
+
+        /* Send on band 0: actual data */
+        hal_send_pulse(0, duration_primary);
+
+        /* Send on bands 1..BANDS-1: speculative / redundant overlay */
+        for (int b = 1; b < BANDS; b++) {
+            hal_send_pulse(b, spec_duration);
+        }
+    }
+}
+
+/* -----------------------------
+   RX ENGINE (MULTI-BAND)
+   ----------------------------- */
+
+void rx_frame_multi_band(uint8_t *bits_out,
+                         size_t max_bits,
+                         double base_us,
+                         double slope_us,
+                         int mode)
+{
+    size_t windows = max_bits / MAX_BITS_16;
+    if (windows == 0) return;
+
+    for (size_t w = 0; w < windows; w++) {
+        /* Read primary band pulse */
+        double duration_primary = hal_recv_pulse(0);
+
+        /* Decode pattern from primary band */
+        uint16_t pattern = pattern_from_duration(duration_primary, base_us, slope_us);
+
+        /* Optionally cross-check other bands for redundancy */
+        for (int b = 1; b < BANDS; b++) {
+            double d = hal_recv_pulse(b);
+            uint16_t p2 = pattern_from_duration(d, base_us, slope_us);
+            /* You could do majority voting or error correction here */
+            (void)p2;
+        }
+
+        /* Convert pattern back to bits */
+        uint8_t *win = &bits_out[w * MAX_BITS_16];
+        pattern_to_bits(pattern, win);
+    }
+}
+
+/* -----------------------------
+   OPENWrt-STYLE DAEMON LOOP
+   ----------------------------- */
+
+int main(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    srand((unsigned)time(NULL));
+
+    double base_us  = 50.0;
+    double slope_us = 200.0;
+    int mode        = MODE_LINEAR;
+
+    slope_predictor_t predictors[BANDS];
+    for (int i = 0; i < BANDS; i++)
+        predictor_init(&predictors[i], 0.2);
+
+    printf("morsebandd: starting multi-band timing daemon\n");
+
+    while (1) {
+        /* Example TX: build a pseudo-random frame */
+        uint8_t tx_bits[TX_FRAME_BITS];
+        for (size_t i = 0; i < TX_FRAME_BITS; i++)
+            tx_bits[i] = rand() & 1;
+
+        tx_frame_multi_band(tx_bits, TX_FRAME_BITS,
+                            base_us, slope_us, mode,
+                            predictors);
+
+        /* Example RX: read a frame back */
+        uint8_t rx_bits[RX_FRAME_BITS];
+        memset(rx_bits, 0, sizeof(rx_bits));
+
+        rx_frame_multi_band(rx_bits, RX_FRAME_BITS,
+                            base_us, slope_us, mode);
+
+        /* In real OpenWrt integration:
+         * - expose rx_bits via tun/tap or netlink
+         * - read tx_bits from a virtual interface
+         */
+
+        usleep(10000); /* daemon pacing */
+    }
+
+    return 0;
+}
